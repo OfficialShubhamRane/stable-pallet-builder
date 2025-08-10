@@ -1,0 +1,152 @@
+[
+  {
+    "name": "B12",
+    "width": 16,
+    "depth": 6,
+    "height": 6,
+    "weight": 42,
+    "x": 0,
+    "y": 0,
+    "z": 0
+  },
+  {
+    "name": "B7",
+    "width": 5,
+    "depth": 6,
+    "height": 9,
+    "weight": 10,
+    "x": 16,
+    "y": 0,
+    "z": 0
+  },
+  {
+    "name": "B14",
+    "width": 15,
+    "depth": 15,
+    "height": 6,
+    "weight": 47,
+    "x": 21,
+    "y": 0,
+    "z": 0
+  },
+  {
+    "name": "B2",
+    "width": 13,
+    "depth": 14,
+    "height": 6,
+    "weight": 38,
+    "x": 0,
+    "y": 15,
+    "z": 0
+  },
+  {
+    "name": "B6",
+    "width": 10,
+    "depth": 9,
+    "height": 10,
+    "weight": 28,
+    "x": 13,
+    "y": 15,
+    "z": 0
+  },
+  {
+    "name": "B5",
+    "width": 7,
+    "depth": 5,
+    "height": 15,
+    "weight": 15,
+    "x": 23,
+    "y": 15,
+    "z": 0
+  },
+  {
+    "name": "B4",
+    "width": 11,
+    "depth": 11,
+    "height": 15,
+    "weight": 30,
+    "x": 0,
+    "y": 29,
+    "z": 0
+  },
+  {
+    "name": "B9",
+    "width": 16,
+    "depth": 15,
+    "height": 9,
+    "weight": 35,
+    "x": 11,
+    "y": 29,
+    "z": 0
+  },
+  {
+    "name": "B3",
+    "width": 10,
+    "depth": 15,
+    "height": 16,
+    "weight": 20,
+    "x": 27,
+    "y": 29,
+    "z": 0
+  },
+  {
+    "name": "B8",
+    "width": 5,
+    "depth": 8,
+    "height": 15,
+    "weight": 5,
+    "x": 0,
+    "y": 0,
+    "z": 6
+  },
+  {
+    "name": "B10",
+    "width": 17,
+    "depth": 6,
+    "height": 14,
+    "weight": 11,
+    "x": 5,
+    "y": 0,
+    "z": 6
+  },
+  {
+    "name": "B11",
+    "width": 14,
+    "depth": 15,
+    "height": 7,
+    "weight": 11,
+    "x": 22,
+    "y": 0,
+    "z": 6
+  },
+  {
+    "name": "B1",
+    "width": 18,
+    "depth": 16,
+    "height": 6,
+    "weight": 11,
+    "x": 0,
+    "y": 15,
+    "z": 6
+  },
+  {
+    "name": "B15",
+    "width": 11,
+    "depth": 14,
+    "height": 11,
+    "weight": 6,
+    "x": 18,
+    "y": 15,
+    "z": 6
+  },
+  {
+    "name": "B13",
+    "width": 19,
+    "depth": 18,
+    "height": 8,
+    "weight": 6,
+    "x": 0,
+    "y": 0,
+    "z": 12
+  }
+]
