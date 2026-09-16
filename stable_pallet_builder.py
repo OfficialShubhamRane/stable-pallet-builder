@@ -1,17 +1,23 @@
-import random
+"""Stable pallet builder.
+
+Packs a set of boxes onto a pallet with a height-map greedy placer, scoring
+each candidate position on support, height, centering and wasted volume, then
+searches over box orderings for the most stable arrangement.
+"""
+
 import itertools
-# import matplotlib
-# matplotlib.use("TkAgg")
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+import json
+import math
+import random
 import signal
 import sys
-import json
-import plotly.graph_objects as go
+
+import ep_packer
+import matplotlib.pyplot as plt
 import numpy as np
-import math
-from copy import deepcopy
-from itertools import permutations
+import plotly.graph_objects as go
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+from numpy.lib.stride_tricks import sliding_window_view
 
 # Configurable parameters
 PALLET_WIDTH = 40      # inches
@@ -21,14 +27,48 @@ NUM_BOXES = 25
 GRID_STEP = 2          # inch resolution
 SUPPORT_THRESHOLD = 0.75  # minimum support ratio for stability
 
+# Search parameters
+SEARCH_ITERATIONS = 500
+
+# Carton mix. Real pallets carry a handful of repeated carton sizes, not 25
+# one-off shapes, so boxes are drawn from a small catalog instead of being
+# randomised dimension by dimension. Fewer types = less variability = tighter,
+# more stable packs.
+CARTON_TYPES = 5          # distinct carton sizes in the catalog
+CARTON_MIN = 6            # smallest carton side, inches
+CARTON_MAX = 20           # largest carton side, inches
+WEIGHT_JITTER = 0.15      # per-box weight variation within a carton type (0 = identical)
+LOAD_BEARING_PSI = (0.3, 1.5)  # lbs/sq-in a carton top can bear before crushing
+
+# Extreme-point packer (see ep_packer.py and REFERENCES.md)
+EP_ITERATIONS = 200       # GRASP iterations
+EP_WEIGHT_BIAS = 8.0      # how hard heavy cargo is pushed toward the deck
+EP_STABILITY_MARGIN = 0.5  # inches the centre of gravity must clear the support hull
+# Cartons usually carry a "this way up" constraint, so only the two base
+# rotations are allowed by default. Tipping a carton onto its edge also packs
+# measurably worse, so this is not a restriction that costs anything here.
+EP_ALLOW_TIPPING = False
+
+# Placement cost weights (lower cost wins). Tune these to change packing style.
+W_HEIGHT = 1.0    # prefer low placements, scaled up for heavy boxes
+W_SUPPORT = 0.6   # prefer fully supported footprints
+W_CENTER = 0.25   # prefer positions near the pallet centre
+W_GAP = 0.4       # penalise voids left under the box
+
+GRID_W = int(PALLET_WIDTH / GRID_STEP)
+GRID_D = int(PALLET_DEPTH / GRID_STEP)
+
+
 # ----- DATA STRUCTURE -----
 class Box:
-    def __init__(self, w, d, h, weight, name):
+    def __init__(self, w, d, h, weight, name, carton=None, max_load=None):
         self.w = w
         self.d = d
         self.h = h
         self.weight = weight
         self.name = name
+        self.carton = carton  # label of the carton size this box came from
+        self.max_load = max_load  # lbs this box can carry on top of it
         self.x = None  # placement coordinates on pallet
         self.y = None
         self.z = None
@@ -39,8 +79,13 @@ class Box:
     def density(self):
         return self.weight / self.volume()
 
+    def copy(self):
+        return Box(self.w, self.d, self.h, self.weight, self.name, self.carton,
+                   self.max_load)
+
     def __repr__(self):
-        return f"{self.name}(W:{self.w},D:{self.d},H:{self.h},Wt:{self.weight})"
+        tag = f"/{self.carton}" if self.carton else ""
+        return f"{self.name}{tag}(W:{self.w},D:{self.d},H:{self.h},Wt:{self.weight})"
 
 
 # ----- STABILITY SCORING -----
@@ -49,6 +94,9 @@ def stability_score(arrangement):
     arrangement: list of (box, x, y, z)
     Returns a score between 0 and 1
     """
+    if not arrangement:
+        return 0
+
     total_weight = sum(b.weight for b, *_ in arrangement)
     if total_weight == 0:
         return 0
@@ -72,410 +120,186 @@ def stability_score(arrangement):
     for b, x, y, _ in arrangement:
         if x + b.w > PALLET_WIDTH or y + b.d > PALLET_DEPTH:
             no_overhang -= 0.2
+    no_overhang = max(0.0, no_overhang)  # never let the term go negative
 
     # Final weighted score
     score = w_bottom_ratio * 0.4 + balance_factor * 0.4 + no_overhang * 0.2
     return round(score, 4)
 
 
-#prioritize center of pallet, but not too much, this one works
-# def build_pallet(boxes):
-    grid_w = int(PALLET_WIDTH / GRID_STEP)
-    grid_d = int(PALLET_DEPTH / GRID_STEP)
-    height_map = [[0] * grid_d for _ in range(grid_w)]
+# ----- PACKING -----
+def _cells(dim):
+    """Grid cells a real dimension occupies.
 
+    Rounds UP: a 7" box on a 2" grid reserves 4 cells (8"), not 3 (6").
+    Truncating here lets neighbouring boxes physically overlap.
+    """
+    return max(1, int(math.ceil(dim / GRID_STEP - 1e-9)))
+
+
+def _base_orientations(box):
+    """Unique footprint orientations, height stays vertical."""
+    if box.w == box.d:
+        return [(box.w, box.d, box.h)]
+    return [(box.w, box.d, box.h), (box.d, box.w, box.h)]
+
+
+# Centre-distance maps are reused across every placement, so build them once
+# per footprint size instead of re-sorting the position list for every box.
+_DIST_CACHE = {}
+
+
+def _centre_distance(wi, di):
+    key = (wi, di)
+    cached = _DIST_CACHE.get(key)
+    if cached is None:
+        xs = np.arange(GRID_W - wi + 1, dtype=float)[:, None] + wi / 2.0
+        ys = np.arange(GRID_D - di + 1, dtype=float)[None, :] + di / 2.0
+        dist = np.sqrt((xs - GRID_W / 2.0) ** 2 + (ys - GRID_D / 2.0) ** 2)
+        peak = dist.max()
+        cached = dist / peak if peak > 0 else dist
+        _DIST_CACHE[key] = cached
+    return cached
+
+
+def _best_placement(height_map, box, weight_norm):
+    """Lowest-cost (x_idx, y_idx, z, orientation) for one box, or None.
+
+    Every candidate position is evaluated at once with a sliding window over the
+    height map, rather than looping over ~GRID_W*GRID_D positions in Python.
+    """
+    best = None
+    best_cost = math.inf
+
+    for w, d, h in _base_orientations(box):
+        wi, di = _cells(w), _cells(d)
+        if wi > GRID_W or di > GRID_D:
+            continue
+
+        win = sliding_window_view(height_map, (wi, di))  # (nx, ny, wi, di)
+        area = wi * di
+        z = win.max(axis=(2, 3))                          # resting height
+        contact = (win == z[:, :, None, None]).sum(axis=(2, 3))
+        support = contact / area
+        void = (z * area - win.sum(axis=(2, 3))) / float(area * MAX_HEIGHT)
+
+        valid = (z + h) <= MAX_HEIGHT
+        # Floor placements are always fully supported; stacked ones must meet
+        # SUPPORT_THRESHOLD so boxes cannot balance on a corner.
+        valid &= (z == 0) | (support >= SUPPORT_THRESHOLD)
+        if not valid.any():
+            continue
+
+        # Heavy boxes pay a steeper penalty for going high, which keeps mass low.
+        cost = (W_HEIGHT * (1.0 + 2.0 * weight_norm) * (z / float(MAX_HEIGHT))
+                + W_SUPPORT * (1.0 - support)
+                + W_CENTER * _centre_distance(wi, di)
+                + W_GAP * void)
+        cost = np.where(valid, cost, np.inf)
+
+        flat = int(np.argmin(cost))
+        c = float(cost.flat[flat])
+        if c < best_cost:
+            xi, yi = np.unravel_index(flat, cost.shape)
+            best_cost = c
+            best = (int(xi), int(yi), int(z[xi, yi]), (w, d, h), wi, di)
+
+    return best
+
+
+def build_pallet(boxes, max_depth=1, presort=False):
+    """Pack boxes onto the pallet.
+
+    boxes    -- placement is attempted in the order given. Set presort=True to
+                sort by density first (the old hard-coded behaviour, which made
+                the caller's ordering irrelevant).
+    max_depth -- extra retry passes over boxes that did not fit. Heights change
+                as other boxes land, so a retry can succeed where the first
+                attempt failed.
+
+    Returns (arrangement, unplaced) where arrangement is a list of
+    (box, x, y, z) and unplaced is the list of boxes that did not fit.
+    """
+    order = sorted(boxes, key=lambda b: b.density(), reverse=True) if presort else list(boxes)
+
+    height_map = np.zeros((GRID_W, GRID_D), dtype=np.int32)
     arrangement = []
-    boxes = sorted(boxes, key=lambda b: b.density(), reverse=True)  # heavier first
+    pending = order
+    max_weight = max((b.weight for b in order), default=1) or 1
 
-    # Center coordinates in grid units
-    center_x = grid_w // 2
-    center_y = grid_d // 2
-
-    def get_max_height(x_idx, y_idx, w_idx, d_idx):
-        max_h = 0
-        for xi in range(x_idx, x_idx + w_idx):
-            for yi in range(y_idx, y_idx + d_idx):
-                if xi >= grid_w or yi >= grid_d:
-                    return None  # out of bounds
-                max_h = max(max_h, height_map[xi][yi])
-        return max_h
-
-    def update_height_map(x_idx, y_idx, w_idx, d_idx, new_height):
-        for xi in range(x_idx, x_idx + w_idx):
-            for yi in range(y_idx, y_idx + d_idx):
-                height_map[xi][yi] = new_height
-
-    # Generate grid positions sorted by distance from center
-    def positions_from_center():
-        positions = [(x, y) for x in range(grid_w) for y in range(grid_d)]
-        positions.sort(key=lambda p: ((p[0] - center_x) ** 2 + (p[1] - center_y) ** 2))
-        return positions
-
-    candidate_positions = positions_from_center()
-
-    for b in boxes:
-        placed = False
-        best_pos = None
-        best_height = None
-        best_orientation = None
-
-        for w, d in [(b.w, b.d), (b.d, b.w)]:  # try both orientations
-            w_idx = int(w / GRID_STEP)
-            d_idx = int(d / GRID_STEP)
-
-            for x_idx, y_idx in candidate_positions:
-                if x_idx + w_idx > grid_w or y_idx + d_idx > grid_d:
-                    continue
-
-                z = get_max_height(x_idx, y_idx, w_idx, d_idx)
-                if z is None:
-                    continue
-                if z + b.h <= MAX_HEIGHT:
-                    if best_height is None or z < best_height:
-                        best_height = z
-                        best_pos = (x_idx, y_idx)
-                        best_orientation = (w, d)
-
-        if best_pos:
-            x_real = best_pos[0] * GRID_STEP
-            y_real = best_pos[1] * GRID_STEP
-            z_real = best_height
-            b.w, b.d = best_orientation
-            arrangement.append((b, x_real, y_real, z_real))
-
-            w_idx = int(b.w / GRID_STEP)
-            d_idx = int(b.d / GRID_STEP)
-            update_height_map(best_pos[0], best_pos[1], w_idx, d_idx, best_height + b.h)
-            placed = True
-
-        if not placed:
-            print(f"Box {b} could not be placed (no space).")
-
-    return arrangement
-
-
-# def build_pallet(boxes):
-    grid_w = int(PALLET_WIDTH / GRID_STEP)
-    grid_d = int(PALLET_DEPTH / GRID_STEP)
-    height_map = [[0] * grid_d for _ in range(grid_w)]
-
-    arrangement = []
-    boxes = sorted(boxes, key=lambda b: b.density(), reverse=True)
-
-    center_x = grid_w // 2
-    center_y = grid_d // 2
-
-    def get_max_height(x_idx, y_idx, w_idx, d_idx):
-        max_h = 0
-        for xi in range(x_idx, x_idx + w_idx):
-            for yi in range(y_idx, y_idx + d_idx):
-                if xi >= grid_w or yi >= grid_d:
-                    return None
-                max_h = max(max_h, height_map[xi][yi])
-        return max_h
-
-    def update_height_map(x_idx, y_idx, w_idx, d_idx, new_height):
-        for xi in range(x_idx, x_idx + w_idx):
-            for yi in range(y_idx, y_idx + d_idx):
-                height_map[xi][yi] = new_height
-
-    def positions_from_center():
-        positions = [(x, y) for x in range(grid_w) for y in range(grid_d)]
-        positions.sort(key=lambda p: ((p[0] - center_x) ** 2 + (p[1] - center_y) ** 2))
-        return positions
-
-    candidate_positions = positions_from_center()
-
-    def generate_orientations(b):
-        dims = [b.w, b.d, b.h]
-        # All unique permutations of dimensions as (width, depth, height)
-        return [
-            (dims[0], dims[1], dims[2]),
-            (dims[1], dims[0], dims[2]),
-            (dims[2], dims[0], dims[1]),
-            (dims[2], dims[1], dims[0]),
-            (dims[0], dims[2], dims[1]),
-            (dims[1], dims[2], dims[0]),
-        ]
-
-    for b in boxes:
-        placed = False
-        best_pos = None
-        best_height = None
-        best_orientation = None
-
-        for w, d, h in generate_orientations(b):
-            w_idx = int(w / GRID_STEP)
-            d_idx = int(d / GRID_STEP)
-
-            if w_idx == 0 or d_idx == 0:
-                continue  # Ignore zero dimension footprints
-
-            for x_idx, y_idx in candidate_positions:
-                if x_idx + w_idx > grid_w or y_idx + d_idx > grid_d:
-                    continue
-
-                z = get_max_height(x_idx, y_idx, w_idx, d_idx)
-                if z is None:
-                    continue
-                if z + h <= MAX_HEIGHT:
-                    if best_height is None or z < best_height:
-                        best_height = z
-                        best_pos = (x_idx, y_idx)
-                        best_orientation = (w, d, h)
-
-        if best_pos:
-            x_real = best_pos[0] * GRID_STEP
-            y_real = best_pos[1] * GRID_STEP
-            z_real = best_height
-            b.w, b.d, b.h = best_orientation  # update box dimensions to chosen orientation
-            arrangement.append((b, x_real, y_real, z_real))
-
-            w_idx = int(b.w / GRID_STEP)
-            d_idx = int(b.d / GRID_STEP)
-            update_height_map(best_pos[0], best_pos[1], w_idx, d_idx, best_height + b.h)
-            placed = True
-
-        if not placed:
-            print(f"Box {b} could not be placed (no space).")
-
-    return arrangement
-
-# this works
-# def build_pallet(boxes):
-    grid_w = int(PALLET_WIDTH / GRID_STEP)
-    grid_d = int(PALLET_DEPTH / GRID_STEP)
-    height_map = [[0] * grid_d for _ in range(grid_w)]
-    weight_map = [[0] * grid_d for _ in range(grid_w)]  # stores max box weight at each cell
-
-    arrangement = []
-    boxes = sorted(boxes, key=lambda b: b.density(), reverse=True)  # heavier first
-
-    center_x = grid_w // 2
-    center_y = grid_d // 2
-
-    def get_max_height(x_idx, y_idx, w_idx, d_idx):
-        max_h = 0
-        for xi in range(x_idx, x_idx + w_idx):
-            for yi in range(y_idx, y_idx + d_idx):
-                if xi >= grid_w or yi >= grid_d:
-                    return None
-                max_h = max(max_h, height_map[xi][yi])
-        return max_h
-
-    def get_max_supporting_weight(x_idx, y_idx, w_idx, d_idx):
-        max_wt = 0
-        for xi in range(x_idx, x_idx + w_idx):
-            for yi in range(y_idx, y_idx + d_idx):
-                if xi >= grid_w or yi >= grid_d:
-                    return 0
-                max_wt = max(max_wt, weight_map[xi][yi])
-        return max_wt
-
-    def update_maps(x_idx, y_idx, w_idx, d_idx, new_height, box_weight):
-        for xi in range(x_idx, x_idx + w_idx):
-            for yi in range(y_idx, y_idx + d_idx):
-                height_map[xi][yi] = new_height
-                weight_map[xi][yi] = box_weight
-
-    def positions_from_center():
-        positions = [(x, y) for x in range(grid_w) for y in range(grid_d)]
-        positions.sort(key=lambda p: ((p[0] - center_x) ** 2 + (p[1] - center_y) ** 2))
-        return positions
-
-    candidate_positions = positions_from_center()
-
-    for b in boxes:
-        placed = False
-        best_pos = None
-        best_height = None
-        best_orientation = None
-
-        for w, d in [(b.w, b.d), (b.d, b.w), (b.h, b.d), (b.d, b.h), (b.w, b.h), (b.h, b.w)]:  # try rotations including height
-            w_idx = int(w / GRID_STEP)
-            d_idx = int(d / GRID_STEP)
-
-            if w_idx == 0 or d_idx == 0:
+    for _ in range(max_depth + 1):
+        if not pending:
+            break
+        unplaced = []
+        for b in pending:
+            spot = _best_placement(height_map, b, b.weight / max_weight)
+            if spot is None:
+                unplaced.append(b)
                 continue
+            xi, yi, z, (w, d, h), wi, di = spot
+            placed = b.copy()
+            placed.w, placed.d, placed.h = w, d, h
+            arrangement.append((placed, xi * GRID_STEP, yi * GRID_STEP, z))
+            height_map[xi:xi + wi, yi:yi + di] = z + h
+        pending = unplaced
 
-            for x_idx, y_idx in candidate_positions:
-                if x_idx + w_idx > grid_w or y_idx + d_idx > grid_d:
-                    continue
-
-                z = get_max_height(x_idx, y_idx, w_idx, d_idx)
-                if z is None:
-                    continue
-                if z + b.h > MAX_HEIGHT:
-                    continue
-
-                max_support_wt = get_max_supporting_weight(x_idx, y_idx, w_idx, d_idx)
-
-                # Allow placement if:
-                # 1. At ground level (z == 0)
-                # 2. Or supporting weight >= box weight
-                if z == 0 or max_support_wt >= b.weight:
-                    if best_height is None or z < best_height:
-                        best_height = z
-                        best_pos = (x_idx, y_idx)
-                        best_orientation = (w, d)
-
-        if best_pos:
-            x_real = best_pos[0] * GRID_STEP
-            y_real = best_pos[1] * GRID_STEP
-            z_real = best_height
-            b.w, b.d = best_orientation
-            arrangement.append((b, x_real, y_real, z_real))
-
-            w_idx = int(b.w / GRID_STEP)
-            d_idx = int(b.d / GRID_STEP)
-            update_maps(best_pos[0], best_pos[1], w_idx, d_idx, best_height + b.h, b.weight)
-            placed = True
-
-        if not placed:
-            print(f"Box {b} could not be placed (no space or weight constraints).")
-
-    return arrangement
+    return arrangement, pending
 
 
-# with basic backtracking
-def build_pallet(boxes, max_depth=1):
-    grid_w = int(PALLET_WIDTH / GRID_STEP)
-    grid_d = int(PALLET_DEPTH / GRID_STEP)
-
-    def init_height_map():
-        return [[0] * grid_d for _ in range(grid_w)]
-
-    # Helper: check max height under footprint or None if OOB
-    def get_max_height(height_map, x_idx, y_idx, w_idx, d_idx):
-        max_h = 0
-        for xi in range(x_idx, x_idx + w_idx):
-            for yi in range(y_idx, y_idx + d_idx):
-                if xi >= grid_w or yi >= grid_d:
-                    return None
-                max_h = max(max_h, height_map[xi][yi])
-        return max_h
-
-    # Helper: update height map footprint with new height
-    def update_height_map(height_map, x_idx, y_idx, w_idx, d_idx, new_height):
-        for xi in range(x_idx, x_idx + w_idx):
-            for yi in range(y_idx, y_idx + d_idx):
-                height_map[xi][yi] = new_height
-
-    # Sort positions from center outward for placement attempts
-    center_x = grid_w // 2
-    center_y = grid_d // 2
-    def positions_from_center():
-        positions = [(x, y) for x in range(grid_w) for y in range(grid_d)]
-        positions.sort(key=lambda p: ((p[0] - center_x) ** 2 + (p[1] - center_y) ** 2))
-        return positions
-
-    # Try placing one box on a given height_map; returns placement or None
-    def try_place_box(height_map, b):
-        candidate_positions = positions_from_center()
-        best_pos = None
-        best_height = None
-        best_orientation = None
-
-        # Try all rotations of box (w,d,h permutations)
-        # For simplicity, rotate only dimensions, height stays last dimension
-        dims = [b.w, b.d, b.h]
-        # Use permutations of (w,d,h), but height is always vertical, so rotate only base
-        base_orientations = [(dims[0], dims[1], dims[2]), (dims[1], dims[0], dims[2])]
-        for (w, d, h) in base_orientations:
-            w_idx = int(w / GRID_STEP)
-            d_idx = int(d / GRID_STEP)
-            for x_idx, y_idx in candidate_positions:
-                if x_idx + w_idx > grid_w or y_idx + d_idx > grid_d:
-                    continue
-                max_h = get_max_height(height_map, x_idx, y_idx, w_idx, d_idx)
-                if max_h is None:
-                    continue
-                if max_h + h <= MAX_HEIGHT:
-                    # Greedy choose lowest height placement
-                    if best_height is None or max_h < best_height:
-                        best_height = max_h
-                        best_pos = (x_idx, y_idx)
-                        best_orientation = (w, d, h)
-
-        if best_pos:
-            # Return box placement data and updated height map
-            x_real = best_pos[0] * GRID_STEP
-            y_real = best_pos[1] * GRID_STEP
-            z_real = best_height
-
-            # Create a copy of height map to update
-            new_height_map = deepcopy(height_map)
-            update_height_map(new_height_map, best_pos[0], best_pos[1],
-                              int(best_orientation[0]/GRID_STEP),
-                              int(best_orientation[1]/GRID_STEP),
-                              best_height + best_orientation[2])
-            # Return placement and new height map
-            placed_box = deepcopy(b)
-            placed_box.w, placed_box.d, placed_box.h = best_orientation
-            return (placed_box, x_real, y_real, z_real), new_height_map
-
-        return None, None
-
-    # Recursive backtracking packing
-    def pack_recursive(box_list, height_map, placed_list, depth):
-        if not box_list:
-            return placed_list  # All boxes placed
-
-        box = box_list[0]
-        rest_boxes = box_list[1:]
-
-        # Try placing current box
-        placement, new_height_map = try_place_box(height_map, box)
-        if placement:
-            # Successful placement, recurse with rest
-            result = pack_recursive(rest_boxes, new_height_map, placed_list + [placement], depth)
-            if result is not None:
-                return result
-
-        # If cannot place and depth > 0, try backtracking by removing one placed box and retry
-        if depth > 0 and placed_list:
-            for i, placed in enumerate(placed_list):
-                # Remove placed[i] and try packing with current + removed box + rest
-                removed_box = placed[0]
-                new_placed = placed_list[:i] + placed_list[i+1:]
-                retry_boxes = [box, removed_box] + rest_boxes
-
-                # Rebuild height map from scratch with new_placed
-                fresh_height_map = init_height_map()
-                valid = True
-                for p_box, px, py, pz in new_placed:
-                    w_idx = int(p_box.w / GRID_STEP)
-                    d_idx = int(p_box.d / GRID_STEP)
-                    max_h = get_max_height(fresh_height_map, int(px / GRID_STEP), int(py / GRID_STEP), w_idx, d_idx)
-                    if max_h is None or max_h > pz:
-                        valid = False
-                        break
-                    update_height_map(fresh_height_map, int(px / GRID_STEP), int(py / GRID_STEP), w_idx, d_idx, pz + p_box.h)
-                if not valid:
-                    continue  # skip invalid partial arrangement
-
-                # Try packing recursively with backtracking depth-1
-                result = pack_recursive(retry_boxes, fresh_height_map, new_placed, depth-1)
-                if result is not None:
-                    return result
-
-        # No valid arrangement found
-        return None
-
-    # Sort boxes by density descending (heaviest first)
-    sorted_boxes = sorted(boxes, key=lambda b: b.density(), reverse=True)
-
-    initial_height_map = init_height_map()
-    arrangement = pack_recursive(sorted_boxes, initial_height_map, [], max_depth)
-
-    if arrangement is None:
-        print("Failed to place all boxes with backtracking.")
-        # Optionally, you could return partial arrangement or empty
-        return []
-
-    return arrangement
+def find_overlaps(arrangement):
+    """Return every physically overlapping pair. Should always be empty."""
+    bad = []
+    for (b1, x1, y1, z1), (b2, x2, y2, z2) in itertools.combinations(arrangement, 2):
+        if boxes_overlap(b1, x1, y1, z1, b2, x2, y2, z2):
+            bad.append((b1.name, b2.name))
+    return bad
 
 
+def search_best_arrangement(boxes, iterations=SEARCH_ITERATIONS, seed=None, verbose=False):
+    """Search box orderings for the most stable arrangement.
+
+    The old loop shuffled the box list and then let build_pallet re-sort it by
+    density, so all iterations produced the same arrangement. Here the ordering
+    the search picks is the ordering that gets packed: seeded heuristics first,
+    then local perturbations of the best order found so far.
+    """
+    rng = random.Random(seed)
+
+    seeds = [
+        sorted(boxes, key=lambda b: b.density(), reverse=True),
+        sorted(boxes, key=lambda b: b.weight, reverse=True),
+        sorted(boxes, key=lambda b: b.volume(), reverse=True),
+        sorted(boxes, key=lambda b: b.w * b.d, reverse=True),
+        sorted(boxes, key=lambda b: (b.h, b.weight), reverse=True),
+    ]
+
+    best_order = None
+    best_result = None
+    best_key = (-1, -1.0)
+
+    for i in range(iterations):
+        if i < len(seeds):
+            order = seeds[i]
+        elif best_order is None:
+            order = rng.sample(list(boxes), len(boxes))
+        else:
+            # Local search: perturb the best known order with a few swaps.
+            order = list(best_order)
+            for _ in range(rng.randint(1, max(2, len(order) // 4))):
+                a, c = rng.randrange(len(order)), rng.randrange(len(order))
+                order[a], order[c] = order[c], order[a]
+
+        arrangement, unplaced = build_pallet(order)
+        # Placing more boxes always beats a prettier score on fewer boxes.
+        key = (len(arrangement), stability_score(arrangement))
+        if key > best_key:
+            best_key = key
+            best_order = order
+            best_result = (arrangement, unplaced)
+            if verbose:
+                print(f"  iter {i:4d}: placed {key[0]}/{len(boxes)}  score {key[1]}")
+
+    return best_result[0], best_result[1], best_key[1]
 # without hover feature for weight and dims
 def plot_pallet_three_views(arrangement):
     fig = plt.figure(figsize=(18, 6))
@@ -596,7 +420,7 @@ def plot_pallet_plotly(boxes, pallet_width=PALLET_WIDTH, pallet_depth=PALLET_DEP
             k=[f[2] for f in faces],
             opacity=0.5,
             color=weight_to_color(b.weight),
-            hovertext=f"id:{b.name} W:{b.w} D:{b.d} H:{b.h}<br>Wt:{b.weight}",
+            hovertext=f"id:{b.name} type:{b.carton} W:{b.w} D:{b.d} H:{b.h}<br>Wt:{b.weight}",
             hoverinfo="text"
         ))
 
@@ -718,6 +542,7 @@ def save_arrangement_json(arrangement, filename="pallet.json"):
     for b, x, y, z in arrangement:
         data.append({
             "name": b.name,
+            "carton": b.carton,
             "width": b.w,
             "depth": b.d,
             "height": b.h,
@@ -732,51 +557,195 @@ def save_arrangement_json(arrangement, filename="pallet.json"):
 
 
 # ----- MAIN -----
+def build_carton_catalog(types=CARTON_TYPES, seed=None):
+    """A small set of distinct carton sizes, like a real warehouse would stock.
+
+    Sides are multiples of GRID_STEP so a carton occupies whole height-map
+    cells; odd sizes get rounded up into the grid and waste the remainder.
+    """
+    rng = random.Random(seed)
+    step = GRID_STEP
+    lo = max(1, CARTON_MIN // step)
+    hi = max(lo, CARTON_MAX // step)
+
+    catalog = []
+    seen = set()
+    attempts = 0
+    while len(catalog) < types and attempts < types * 200:
+        attempts += 1
+        w, d, h = (rng.randint(lo, hi) * step for _ in range(3))
+        w, d = max(w, d), min(w, d)  # normalise footprint so W/D swaps aren't duplicates
+        if (w, d, h) in seen:
+            continue
+        seen.add((w, d, h))
+        catalog.append({
+            "label": f"C{len(catalog)+1}",
+            "w": w, "d": d, "h": h,
+            # lbs per cubic inch, so weight tracks carton size sensibly
+            "density": rng.uniform(0.004, 0.02),
+            # lbs per square inch the carton top can bear (Bischoff 2006)
+            "bearing": rng.uniform(*LOAD_BEARING_PSI),
+        })
+    return catalog
+
+
+def check_load_bearing(arrangement, tol=1e-6):
+    """Cartons carrying more than their rated top load. Should be empty.
+
+    Weight is passed down through whatever a box rests on, split by contact
+    area, following Bischoff (2006).
+    """
+    borne = {id(b): 0.0 for b, *_ in arrangement}
+    index = {id(b): b for b, *_ in arrangement}
+    order = sorted(arrangement, key=lambda t: -t[3])  # top down
+    for b, x, y, z in order:
+        load = b.weight + borne[id(b)]
+        supports = []
+        for o, ox, oy, oz in arrangement:
+            if o is b or abs(oz + o.h - z) > 1e-6:
+                continue
+            ow = min(x + b.w, ox + o.w) - max(x, ox)
+            od = min(y + b.d, oy + o.d) - max(y, oy)
+            if ow > 1e-6 and od > 1e-6:
+                supports.append((o, ow * od))
+        total = sum(a for _, a in supports)
+        for o, a in supports:
+            borne[id(o)] += load * a / total
+    over = []
+    for key, load in borne.items():
+        b = index[key]
+        if b.max_load is not None and load > b.max_load + tol:
+            over.append(f"{b.name} {load:.0f}/{b.max_load:.0f}lb")
+    return over
+
+
+def check_stability(arrangement):
+    """Boxes whose centre of gravity falls outside their support hull."""
+    bad = []
+    for b, x, y, z in arrangement:
+        if z <= 1e-6:
+            continue
+        pts = []
+        for o, ox, oy, oz in arrangement:
+            if o is b or abs(oz + o.h - z) > 1e-6:
+                continue
+            x0, y0 = max(x, ox), max(y, oy)
+            x1, y1 = min(x + b.w, ox + o.w), min(y + b.d, oy + o.d)
+            if x1 - x0 > 1e-6 and y1 - y0 > 1e-6:
+                pts += [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+        hull = ep_packer._convex_hull(pts)
+        if not ep_packer._inside_hull(hull, x + b.w / 2, y + b.d / 2, 0.0):
+            bad.append(b.name)
+    return bad
+
+
+def generate_boxes(count=NUM_BOXES, seed=None, types=CARTON_TYPES, jitter=WEIGHT_JITTER):
+    """Draw `count` boxes from a catalog of `types` distinct carton sizes."""
+    catalog = build_carton_catalog(types, seed=seed)
+    rng = random.Random(seed)
+
+    boxes = []
+    for i in range(count):
+        c = catalog[i % len(catalog)] if i < len(catalog) else rng.choice(catalog)
+        base = c["w"] * c["d"] * c["h"] * c["density"]
+        weight = int(round(base * rng.uniform(1 - jitter, 1 + jitter)))
+        boxes.append(Box(
+            w=c["w"], d=c["d"], h=c["h"],
+            weight=max(1, weight),
+            name=f"B{i+1}",
+            carton=c["label"],
+            max_load=round(c["bearing"] * c["w"] * c["d"], 1),
+        ))
+    rng.shuffle(boxes)
+    return boxes
+
+
+def describe_mix(boxes):
+    """One line per carton type: size, count, weight range."""
+    groups = {}
+    for b in boxes:
+        groups.setdefault(b.carton or "-", []).append(b)
+    lines = []
+    for label in sorted(groups, key=lambda k: -len(groups[k])):
+        g = groups[label]
+        b = g[0]
+        weights = [x.weight for x in g]
+        span = f"{min(weights)}" if min(weights) == max(weights) else f"{min(weights)}-{max(weights)}"
+        lines.append(f"  {label}: {b.w}x{b.d}x{b.h}\"  x{len(g):<3} {span} lbs")
+    return lines
+
+
 if __name__ == "__main__":
-    
+
     def signal_handler(sig, frame):
         print("\nCtrl+C detected! Exiting gracefully...")
         sys.exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
 
-    # Generate random boxes
-    boxes = [
-        Box(
-            w=random.randint(5, 20),   # smaller boxes max 20" width
-            d=random.randint(5, 20),   # smaller boxes max 20" depth
-            h=random.randint(5, 20),   # smaller boxes max 20" height
-            weight=random.randint(5, 50),  # weight in lbs
-            name=f"B{i+1}"
+    args = sys.argv[1:]
+
+    def arg(flag, default, cast=int):
+        if flag in args:
+            return cast(args[args.index(flag) + 1])
+        return default
+
+    seed = arg("--seed", None)
+    iterations = arg("--iterations", SEARCH_ITERATIONS)
+    show_plot = "--no-plot" not in args
+
+    carton_types = arg("--carton-types", CARTON_TYPES)
+
+    packer = "heightmap" if "--packer" in args and args[args.index("--packer") + 1] == "heightmap" else "ep"
+
+    boxes = generate_boxes(NUM_BOXES, seed=seed, types=carton_types)
+    print(f"Carton mix ({carton_types} type(s), {len(boxes)} boxes):")
+    for line in describe_mix(boxes):
+        print(line)
+
+    if packer == "ep":
+        arrangement, unplaced, score = ep_packer.search(
+            boxes, PALLET_WIDTH, PALLET_DEPTH, MAX_HEIGHT, stability_score,
+            iterations=min(iterations, EP_ITERATIONS), seed=seed,
+            weight_bias=EP_WEIGHT_BIAS, stability_margin=EP_STABILITY_MARGIN,
+            allow_tipping_rotations=EP_ALLOW_TIPPING or "--allow-tipping" in args,
+            verbose="--verbose" in args,
         )
-        for i in range(NUM_BOXES)
-    ]
+    else:
+        arrangement, unplaced, score = search_best_arrangement(
+            boxes, iterations=iterations, seed=seed, verbose="--verbose" in args
+        )
+    print(f"Packer: {packer}")
 
-    # Try different random shuffles & pick best score
-    best_score = 0
-    best_arrangement = None
+    print(f"Best stability score: {score}")
+    print(f"Placed {len(arrangement)}/{len(boxes)} boxes"
+          + (f" (unplaced: {', '.join(b.name for b in unplaced)})" if unplaced else ""))
 
-    for _ in range(500):  # number of random tries
-        random.shuffle(boxes)
-        arr = build_pallet(boxes)
-        score = stability_score(arr)
-        if score > best_score:
-            best_score = score
-            best_arrangement = arr
+    overlaps = find_overlaps(arrangement)
+    if overlaps:
+        print(f"WARNING: {len(overlaps)} overlapping pairs: {overlaps[:5]}")
+    else:
+        print("No overlapping boxes.")
 
-    print(f"Best stability score: {best_score}")
+    unstable = check_stability(arrangement)
+    print("Equilibrium: "
+          + ("every box's centre of gravity is over its support"
+             if not unstable else f"UNSTABLE: {unstable}"))
+
+    print(f"Load bearing: "
+          + ("no carton over its rated top load"
+             if not check_load_bearing(arrangement)
+             else f"OVER LIMIT: {check_load_bearing(arrangement)}"))
+    print(f"Stack height: {max((z + b.h for b, _, _, z in arrangement), default=0)}\" of {MAX_HEIGHT}\"")
     print("Arrangement (Box, X, Y, Z):")
-    for b, x, y, z in best_arrangement:
+    for b, x, y, z in arrangement:
         print(f"{b} -> Pos({x},{y},{z})")
 
-    # plot_pallet_three_views(best_arrangement)
+    save_arrangement_json(arrangement)
 
-    best_best_arrangement = []
-    for b, x, y, z in best_arrangement:
-        b.x, b.y, b.z = x, y, z
-        best_best_arrangement.append(b)
-    plot_pallet_plotly(best_best_arrangement)
-    
-    # save_arrangement_json(best_arrangement)
-
-    
+    if show_plot:
+        positioned = []
+        for b, x, y, z in arrangement:
+            b.x, b.y, b.z = x, y, z
+            positioned.append(b)
+        plot_pallet_plotly(positioned)
